@@ -30,7 +30,7 @@ flowchart TD
             T6["⚡ detect_wash_trade\ntime_diff < 1s\nwash_score ≥ 0.8"]:::spark
         end
 
-        T7["🐍 load_gold_to_mysql\nSQLAlchemy · Pandas"]:::py
+        T7["🐍 load_gold_to_mysql\nPandas df.to_sql() · SQLAlchemy engine"]:::py
         T8["✅ validate_dw_counts\nRow count assertions"]:::py
 
         T1 --> T2 --> T3 --> T4 & T5 & T6 --> T7 --> T8
@@ -56,7 +56,7 @@ flowchart TD
         FT["fact_trades"]:::fact
         FP["fact_pump_dump_events"]:::fact
         FW["fact_wash_trade_pairs"]:::fact
-        DIM --- FT
+        DIM -->|FK: date_id| FT
     end
 
     A --> B --> T1
@@ -257,10 +257,12 @@ Only pairs with `wash_score ≥ 0.80` are written to the DW.
 ## MySQL Data Warehouse Schema
 
 ```
-dim_date ─────────────── fact_trades          (FK: date_id)
-dim_time_window          fact_pump_dump_events
-                         fact_wash_trade_pairs
+dim_date ──FK: date_id──► fact_trades
+                           fact_pump_dump_events
+                           fact_wash_trade_pairs
 ```
+
+> `dim_time_window` is defined in `init.sql` as a reserved table but is not populated by the current pipeline.
 
 See [`sql/init.sql`](sql/init.sql) for full DDL.
 
