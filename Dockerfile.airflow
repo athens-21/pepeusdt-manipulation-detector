@@ -1,0 +1,14 @@
+FROM apache/airflow:2.8.1-python3.11
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jre-headless \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+USER airflow
+RUN pip install --no-cache-dir \
+    "apache-airflow-providers-apache-spark==4.7.0" \
+    "pymysql==1.1.1" \
+    "pyarrow==14.0.2" \
+    "pandas==2.1.4" \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.8.1/constraints-3.11.txt"

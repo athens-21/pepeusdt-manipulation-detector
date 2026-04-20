@@ -1,0 +1,42 @@
+# Environment
+.env
+
+# Data directories (populated at runtime)
+data/landing/*
+data/bronze/*
+data/silver/*
+data/gold/*
+data/ landing/
+
+# Keep .gitkeep placeholders
+!data/landing/.gitkeep
+!data/bronze/.gitkeep
+!data/silver/.gitkeep
+!data/gold/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Airflow
+logs/
+airflow.db
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Claude Code
+.claude/
