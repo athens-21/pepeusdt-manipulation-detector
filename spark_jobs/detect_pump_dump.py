@@ -1,21 +1,31 @@
 """
 Pump & Dump detection on 5-minute OHLCV candles.
 
-Algorithm:
-  1. Identify PUMP candles: price change >= 10% AND volume >= 2.5x rolling average
-  2. For each pump candle look forward 12 candles (60 min)
-  3. Confirm DUMP: minimum close in the next 60 min drops <= -7% from pump peak
+Algorithm (rolling peak/trough):
+  1. For each candle compute rise_from_30m_low:
+       rolling_low = min(close) over past 6 candles (30 min)
+       rise_pct    = (close - rolling_low) / rolling_low * 100
+  2. PUMP confirmed when rise_pct >= PUMP_THRESHOLD (1.5%)
+     AND volume_usdt >= 2x rolling 30-min average volume
+  3. For each pump peak look forward 12 candles (60 min)
+  4. DUMP confirmed when min(future_close) drops <= -DUMP_THRESHOLD (-1.0%) from peak
+
+Thresholds calibrated against PEPE 5-min candle data where
+typical p90 rise-from-30m-low is ~0.9% and max observed is ~3%.
 
 Usage:
     spark-submit detect_pump_dump.py --ds 2026-04-13
 """
 
 import argparse
-import sys
 
 from pyspark.sql import SparkSession, Window
 import pyspark.sql.functions as F
-from pyspark.sql.types import StringType
+
+PUMP_THRESHOLD = 1.5   # % rise from rolling 30m low
+DUMP_THRESHOLD = -1.0  # % drop from peak within next 60 min
+LOOKBACK_CANDLES = 6   # 6 × 5 min = 30 min rolling window
+LOOKAHEAD_CANDLES = 12 # 12 × 5 min = 60 min forward window
 
 
 def parse_args():
@@ -47,48 +57,47 @@ def main():
     print(f"[detect_pump_dump] OHLCV candle count: {df.count()}")
 
     # ------------------------------------------------------------------
-    # 2. Window functions ordered by window_start
+    # 2. Rolling 30-min low and average volume (past 6 candles)
     # ------------------------------------------------------------------
-    w_ordered = Window.orderBy("window_start")
+    w_lookback = (
+        Window.orderBy("window_start")
+        .rowsBetween(-LOOKBACK_CANDLES, -1)
+    )
 
-    # Previous close (lag 1)
-    df = df.withColumn("prev_close", F.lag("close", 1).over(w_ordered))
+    df = (
+        df
+        .withColumn("rolling_low_30m",    F.min("close").over(w_lookback))
+        .withColumn("rolling_avg_vol_30m", F.avg("volume_usdt").over(w_lookback))
+    )
 
-    # Percent change from previous close
+    # ------------------------------------------------------------------
+    # 3. Compute rise_from_30m_low
+    # ------------------------------------------------------------------
     df = df.withColumn(
-        "pct_change",
+        "rise_from_low_pct",
         F.when(
-            F.col("prev_close").isNotNull() & (F.col("prev_close") > 0),
-            (F.col("close") - F.col("prev_close")) / F.col("prev_close") * 100
+            F.col("rolling_low_30m").isNotNull() & (F.col("rolling_low_30m") > 0),
+            (F.col("close") - F.col("rolling_low_30m")) / F.col("rolling_low_30m") * 100
         ).otherwise(F.lit(None).cast("double"))
     )
 
-    # ------------------------------------------------------------------
-    # 3. 7-period rolling average volume (±3 rows around current row)
-    # ------------------------------------------------------------------
-    w_rolling = (
-        Window.orderBy("window_start")
-        .rowsBetween(-3, 3)
-    )
-    df = df.withColumn("avg_volume", F.avg("volume_usdt").over(w_rolling))
-
     # Materialise with row_number for forward-looking join
+    w_ordered = Window.orderBy("window_start")
     df = df.withColumn("row_num", F.row_number().over(w_ordered))
     df.cache()
 
     # ------------------------------------------------------------------
-    # 4. Detect PUMP candles
+    # 4. Identify pump peaks
     # ------------------------------------------------------------------
     pump_candles = df.filter(
-        (F.col("pct_change") >= 10)
-        & (F.col("volume_usdt") >= F.col("avg_volume") * 2.5)
+        (F.col("rise_from_low_pct") >= PUMP_THRESHOLD)
+        & (F.col("volume_usdt") >= F.col("rolling_avg_vol_30m") * 2.0)
     )
     pump_count = pump_candles.count()
-    print(f"[detect_pump_dump] Pump candles identified: {pump_count}")
+    print(f"[detect_pump_dump] Pump peaks identified: {pump_count}")
 
     if pump_count == 0:
-        print(f"[detect_pump_dump] No pump candles found for {ds}. Writing empty output.")
-        # Write empty parquet with consistent schema
+        print(f"[detect_pump_dump] No pump peaks found for {ds}. Writing empty output.")
         spark.createDataFrame([], schema=_output_schema()).write.mode("overwrite").parquet(
             f"/data/gold/pump_dump_signals/trade_date={ds}"
         )
@@ -96,16 +105,15 @@ def main():
         return
 
     # ------------------------------------------------------------------
-    # 5. For each pump, look forward 12 candles to find the dump
-    #    Join pump candles with all candles where row_num is in (pump+1, pump+12)
+    # 5. For each pump peak, look forward LOOKAHEAD_CANDLES to find dump
     # ------------------------------------------------------------------
     pump_alias = pump_candles.select(
         F.col("row_num").alias("pump_row"),
         F.col("window_start").alias("pump_window_start"),
         F.col("window_end").alias("pump_window_end"),
-        F.col("prev_close").alias("price_at_pump_start"),
+        F.col("rolling_low_30m").alias("price_at_pump_start"),
         F.col("close").alias("price_at_peak"),
-        F.col("pct_change").alias("pump_pct"),
+        F.col("rise_from_low_pct").alias("pump_pct"),
         F.col("volume_usdt").alias("volume_usdt_during_pump"),
     )
 
@@ -114,14 +122,12 @@ def main():
         F.col("close").alias("future_close"),
     )
 
-    # Cross-join within the 12-candle forward window
     events = pump_alias.join(
         future_alias,
         (future_alias["future_row"] > pump_alias["pump_row"])
-        & (future_alias["future_row"] <= pump_alias["pump_row"] + 12)
+        & (future_alias["future_row"] <= pump_alias["pump_row"] + LOOKAHEAD_CANDLES)
     )
 
-    # Minimum close in the look-ahead window per pump candle
     events = events.groupBy(
         "pump_row", "pump_window_start", "pump_window_end",
         "price_at_pump_start", "price_at_peak", "pump_pct", "volume_usdt_during_pump"
@@ -130,25 +136,25 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # 6. Calculate dump % and filter: dump_pct <= -7
+    # 6. Calculate dump_pct and filter
     # ------------------------------------------------------------------
     events = events.withColumn(
         "dump_pct",
         (F.col("price_after_dump") - F.col("price_at_peak")) / F.col("price_at_peak") * 100
     )
 
-    events = events.filter(F.col("dump_pct") <= -7)
+    events = events.filter(F.col("dump_pct") <= DUMP_THRESHOLD)
 
     # ------------------------------------------------------------------
-    # 7. Add derived columns
+    # 7. Severity based on pump_pct relative to PEPE's typical range
     # ------------------------------------------------------------------
     events = (
         events
         .withColumn("estimated_profit_pct", F.col("pump_pct"))
         .withColumn(
             "severity",
-            F.when(F.col("pump_pct") >= 20, F.lit("HIGH"))
-             .when(F.col("pump_pct") >= 10, F.lit("MEDIUM"))
+            F.when(F.col("pump_pct") >= 2.5, F.lit("HIGH"))
+             .when(F.col("pump_pct") >= 1.5, F.lit("MEDIUM"))
              .otherwise(F.lit("LOW"))
         )
         .withColumn("trade_date", F.lit(ds).cast("date"))

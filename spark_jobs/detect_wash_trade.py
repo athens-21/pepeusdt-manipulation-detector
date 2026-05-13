@@ -89,7 +89,7 @@ def main():
     # ------------------------------------------------------------------
     pairs = pairs.withColumn(
         "time_diff_ms",
-        F.abs(F.col("buy_time") - F.col("sell_time"))
+        (F.abs(F.col("buy_time") - F.col("sell_time")) / 1000).cast("long")
     ).withColumn(
         "price_diff_pct",
         F.abs(F.col("buy_price") - F.col("sell_price")) / F.col("buy_price") * 100
@@ -99,7 +99,7 @@ def main():
     )
 
     pairs = pairs.filter(
-        (F.col("time_diff_ms") < 1000)
+        (F.col("time_diff_ms") < 1000)   # < 1000ms = < 1 second
         & (F.col("price_diff_pct") < 0.1)
         & (F.col("qty_similarity_pct") > 90)
     )

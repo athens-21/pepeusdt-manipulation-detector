@@ -13,7 +13,6 @@ import os
 import zipfile
 from datetime import datetime, timedelta
 
-import pandas as pd
 from airflow import DAG
 from airflow.models import Variable
 from airflow.models.param import Param
@@ -99,6 +98,7 @@ BRONZE_COLUMNS = [
 ]
 
 def ingest_to_bronze(**context) -> str:
+    import pandas as pd
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -138,6 +138,7 @@ def ingest_to_bronze(**context) -> str:
 # Task: load_gold_to_mysql
 # ---------------------------------------------------------------------------
 def load_gold_to_mysql(**context) -> None:
+    import pandas as pd
     from sqlalchemy import create_engine, text
 
     ds = _get_ds(context)
@@ -185,6 +186,7 @@ def load_gold_to_mysql(**context) -> None:
 
 
 def _load_silver_trades(engine, ds: str) -> None:
+    import pandas as pd
     silver_path = _silver_path(ds)
     print(f"[load_gold_to_mysql] Loading fact_trades from {silver_path}")
 
@@ -210,6 +212,7 @@ def _load_silver_trades(engine, ds: str) -> None:
 
 
 def _load_pump_dump(engine, ds: str) -> None:
+    import pandas as pd
     from sqlalchemy import text
     gold_path = _gold_pump_dump_path(ds)
     print(f"[load_gold_to_mysql] Loading fact_pump_dump_events from {gold_path}")
@@ -235,6 +238,7 @@ def _load_pump_dump(engine, ds: str) -> None:
 
 
 def _load_wash_trades(engine, ds: str) -> None:
+    import pandas as pd
     from sqlalchemy import text
     gold_path = _gold_wash_trade_path(ds)
     print(f"[load_gold_to_mysql] Loading fact_wash_trade_pairs from {gold_path}")
@@ -306,9 +310,10 @@ def validate_dw_counts(**context) -> None:
 with DAG(
     dag_id="pepe_daily_pipeline",
     description="PEPEUSDT market manipulation detection pipeline",
-    start_date=datetime(2026, 4, 12),
-    schedule="0 1 * * *",
+    start_date=datetime(2026, 4, 13),
+    schedule=None,
     catchup=False,
+    max_active_runs=1,
     default_args=DEFAULT_ARGS,
     params={
         "ds": Param(
@@ -337,6 +342,9 @@ with DAG(
     _spark_conf   = {
         "spark.master": _spark_master,
         "spark.executorEnv.PYSPARK_PYTHON": "/usr/local/bin/python3.11",
+        "spark.driver.memory": "512m",
+        "spark.executor.memory": "800m",
+        "spark.executor.cores": "1",
     }
     _ds_arg       = '{{ dag_run.conf.get("ds") or ds }}'
 
@@ -391,7 +399,8 @@ with DAG(
         >> t_check_landing
         >> t_ingest_bronze
         >> t_bronze_to_silver
-        >> [t_detect_pump_dump, t_detect_wash_trade, t_compute_ohlcv]
+        >> t_compute_ohlcv
+        >> [t_detect_pump_dump, t_detect_wash_trade]
         >> t_load_mysql
         >> t_validate
         >> end

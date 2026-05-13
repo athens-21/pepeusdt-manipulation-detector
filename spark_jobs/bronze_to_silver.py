@@ -109,7 +109,7 @@ def main():
         df
         .withColumn("trade_hour",     F.hour(F.col("trade_time")))
         .withColumn("trade_minute",   F.minute(F.col("trade_time")))
-        .withColumn("is_sell",        ~F.col("is_buyer_maker"))
+        .withColumn("is_sell",        F.col("is_buyer_maker"))
         .withColumn("usd_value",      F.col("qty") * F.col("price"))
         .withColumn("processed_date", F.lit(ds).cast(DateType()))
     )

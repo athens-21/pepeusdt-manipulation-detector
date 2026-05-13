@@ -26,6 +26,7 @@ x-airflow-common: &airflow-common
     - ./dq:/opt/airflow/dq
     - ./data:/opt/airflow/data
     - ./data:/data
+    - ./scripts:/opt/airflow/scripts
     - airflow-logs:/opt/airflow/logs
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -132,7 +133,7 @@ services:
     image: pepe-spark:3.5.0-py311
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
-      SPARK_WORKER_MEMORY: 4g
+      SPARK_WORKER_MEMORY: 1500m
       SPARK_WORKER_CORES: 2
       SPARK_WORKER_WEBUI_PORT: 8081
     volumes:
