@@ -734,3 +734,366 @@ _spark_conf = {
 ถ้าไม่ตั้งค่า Spark จะขอ memory เกิน → OS kill process ด้วย error code -9
 
 config นี้ใช้กับทุก SparkSubmitOperator ทั้ง 4 ตัว (bronze_to_silver, compute_ohlcv, detect_pump_dump, detect_wash_trade)
+
+---
+
+## ทำไมถึงเลือกแบบนี้? — เหตุผลเบื้องหลังทุก Design Decision
+
+---
+
+### pepe_run_all.py — ทำไมต้องมี DAG แยกสำหรับ trigger?
+
+**ปัญหา:** pipeline ต้อง process หลายวันพร้อมกัน (backfill 8 วัน)
+ถ้าใช้ DAG เดียวและ trigger ด้วยมือทีละวัน = ต้องกด 8 ครั้ง
+
+**ทางเลือกที่ไม่เลือก:**
+- `schedule="@daily"` + `catchup=True` — Airflow จะ run ย้อนหลังอัตโนมัติ แต่ควบคุมลำดับและ error handling ได้ยากกว่า
+- Loop ใน DAG เดียว — Airflow ไม่ได้ออกแบบมาให้ DAG หนึ่ง process หลาย date ใน run เดียว
+
+**ที่เลือก:** `pepe_run_all.py` scan ZIP แล้ว trigger `pepe_daily_pipeline` ทีละวัน ทำให้แต่ละวันมี run_id แยก, log แยก, retry แยกกันได้อิสระ
+
+---
+
+### pepe_daily_pipeline.py — ทำไม `schedule=None`?
+
+```python
+schedule=None
+```
+
+Pipeline นี้ไม่มี schedule เพราะ **raw data ต้องดาวน์โหลดจาก Binance เองก่อน** ถึงจะรันได้ ถ้าตั้ง `schedule="@daily"` Airflow จะ trigger อัตโนมัติแม้ไฟล์ยังไม่มี → task แรกจะ fail ทุกวัน
+
+---
+
+### pepe_daily_pipeline.py — ทำไม `retries=2, retry_delay=10min`?
+
+```python
+"retries": 2,
+"retry_delay": timedelta(minutes=10),
+```
+
+Spark jobs บน Docker อาจ fail เพราะ resource contention (RAM เต็มชั่วคราว) ไม่ใช่ bug ใน code — retry อัตโนมัติช่วยให้ผ่านได้โดยไม่ต้องแทรกแซงด้วยมือ
+10 นาทีเพียงพอให้ container คืน memory ก่อน retry
+
+---
+
+### pepe_daily_pipeline.py — ทำไม `max_active_runs=1`?
+
+```python
+max_active_runs=1,
+```
+
+Spark worker มี memory จำกัด (800m) ถ้ารัน 2 วันพร้อมกัน Spark จะแย่ง memory กัน → OOM → ทั้งคู่ fail
+จำกัดไว้ที่ 1 active run = รันทีละวัน เสร็จแล้วค่อยรันวันถัดไป
+
+---
+
+### pepe_daily_pipeline.py — ทำไม helper functions `_landing_path`, `_bronze_path`, ...?
+
+```python
+def _landing_path(ds): return f"{DATA_ROOT}/landing/PEPEUSDT-trades-{ds}.zip"
+def _bronze_path(ds):  return f"{DATA_ROOT}/bronze/trades/trade_date={ds}/data.parquet"
+```
+
+Path ของแต่ละ layer ถูกใช้ใน **หลาย task** (check → ingest → load → validate)
+ถ้าเขียน path inline ทุกที่ → แก้ชื่อครั้งเดียวต้องไล่แก้ทุก task
+รวม path ไว้ที่เดียว → แก้ที่เดียวมีผลทุกที่
+
+---
+
+### pepe_daily_pipeline.py — ทำไม `PythonOperator` สำหรับ landing/bronze แต่ `SparkSubmitOperator` สำหรับ silver/gold?
+
+| Task | Operator | เหตุผล |
+|---|---|---|
+| check_landing, ingest_to_bronze, load_mysql, validate | `PythonOperator` | งานเล็ก: เช็คไฟล์, อ่าน CSV, write MySQL — ไม่ต้องการ distributed compute |
+| bronze_to_silver, compute_ohlcv, detect_* | `SparkSubmitOperator` | งานหนัก: process ข้อมูลล้าน rows, rolling window, cross-join — ต้องการ Spark |
+
+การใช้ Spark กับงานเล็กจะเสีย overhead ในการสร้าง SparkSession โดยไม่จำเป็น
+
+---
+
+### pepe_daily_pipeline.py — ทำไม `pool_pre_ping=True`?
+
+```python
+engine = create_engine(..., pool_pre_ping=True)
+```
+
+SQLAlchemy มี connection pool — connection ที่ idle นาน ๆ อาจถูก MySQL ปิดฝั่ง server แต่ pool ยังคิดว่า connection ยังอยู่
+`pool_pre_ping=True` ping connection ก่อนใช้งานทุกครั้ง ถ้าตาย → สร้างใหม่อัตโนมัติ
+หากไม่ใส่ → `MySQL server has gone away` error ที่หาสาเหตุยาก
+
+---
+
+### pepe_daily_pipeline.py — ทำไม `INSERT IGNORE` สำหรับ dim_date แต่ `DELETE + INSERT` สำหรับ fact tables?
+
+**dim_date:**
+```python
+INSERT IGNORE INTO dim_date ...
+```
+วันที่ไม่เปลี่ยน — 2026-04-13 จะเป็น วันอาทิตย์เสมอ ถ้ามีอยู่แล้ว skip ได้เลย
+
+**fact tables:**
+```python
+DELETE FROM fact_trades WHERE processed_date = :ds
+# แล้วค่อย INSERT ใหม่
+```
+ข้อมูล trade อาจแก้ไขได้ถ้าพบ bug แล้ว re-process — DELETE ก่อนทำให้ run ซ้ำได้โดยไม่ duplicate
+เรียกว่า **idempotent** = รันกี่ครั้งผลลัพธ์เหมือนเดิมเสมอ
+
+---
+
+### pepe_daily_pipeline.py — ทำไม `chunksize=5000` ใน `to_sql`?
+
+```python
+df.to_sql("fact_trades", engine, if_exists="append", index=False, chunksize=5000)
+```
+
+fact_trades มีข้อมูล ~1 ล้าน rows ต่อวัน ถ้า INSERT ทั้งหมดใน query เดียว → MySQL packet size เกิน limit (`max_allowed_packet`)
+5,000 rows ต่อ batch = query ขนาดพอดี ไม่ crash
+
+---
+
+### pepe_daily_pipeline.py — ทำไม validate แค่ `fact_trades` แต่ไม่ validate pump/wash?
+
+```python
+if table == "fact_trades" and count == 0:
+    failed_tables.append(table)
+```
+
+`fact_trades` ต้องมีข้อมูลเสมอ — ถ้า 0 rows แปลว่า load ล้มเหลวแน่นอน
+แต่ `fact_pump_dump_events` และ `fact_wash_trade_pairs` อาจมี 0 rows ได้ถ้าวันนั้นไม่มี event — ไม่ถือเป็น error
+
+---
+
+### bronze_to_silver.py — ทำไมต้อง Cast Types ทั้งที่ parquet มี schema อยู่แล้ว?
+
+```python
+.withColumn("price", F.col("price").cast(DoubleType()))
+.withColumn("time",  F.col("time").cast(LongType()))
+```
+
+pandas `read_csv` + `write_parquet` อาจ infer type ผิด เช่น:
+- `time` (เลข 16 หลัก) → pandas อาจ infer เป็น `float64` แทน `int64` → เกิด precision loss
+- `is_buyer_maker` อ่านเป็น string `"True"/"False"` → ต้อง cast เป็น `BooleanType` เอง
+
+Cast ใน Spark step นี้คือ **contract** ว่า silver layer มี schema ที่เชื่อถือได้แน่นอน
+
+---
+
+### bronze_to_silver.py — ทำไมหาร 1,000,000 ก่อน `to_timestamp`?
+
+```python
+F.to_timestamp(F.col("time") / 1_000_000)
+```
+
+Binance ส่ง `time` หน่วย **microseconds** (1 วินาที = 1,000,000 microseconds)
+`to_timestamp()` รับหน่วย **seconds** → ต้องหารก่อน
+ถ้าไม่หาร → ได้ปี ค.ศ. ประมาณ 58,000 (ไม่ใช่ 2026)
+
+---
+
+### bronze_to_silver.py — ทำไมรัน DQ checks **ก่อน** filter ข้อมูลเสีย?
+
+```python
+run_all_checks(df, ds=ds)   # บรรทัด 76
+# แล้วค่อย filter...
+df = df.filter(F.col("price") > 0)  # บรรทัด 82
+```
+
+DQ check วัดคุณภาพของ **raw bronze data** — ถ้า filter ก่อนแล้วค่อย check จะไม่รู้ว่าต้นทางเสียแค่ไหน
+ถ้า bronze มี invalid price > 1% → หยุดทันที ไม่ต้องเสียเวลา process ต่อ
+
+---
+
+### bronze_to_silver.py — ทำไมนับ rows ก่อนและหลัง filter ทุกขั้น?
+
+```python
+before_price_filter = df.count()
+df = df.filter(...)
+after_price_filter = df.count()
+print(f"Rows removed: {before_price_filter - after_price_filter}")
+```
+
+เพื่อ **observability** — ถ้า pipeline fail หรือผลลัพธ์ผิด สามารถดู log แล้วรู้ทันทีว่า data หายไปที่ step ไหนกี่ rows
+
+---
+
+### compute_ohlcv.py — ทำไม 5 นาที? ไม่ใช่ 1 นาทีหรือ 1 ชั่วโมง?
+
+```python
+F.window(F.col("trade_time"), "5 minutes")
+```
+
+- **1 นาที** — noise เยอะ สัญญาณ pump/dump ไม่ชัด
+- **5 นาที** — มาตรฐานของ technical analysis crypto ส่วนใหญ่, ชัดพอที่จะเห็น pattern แต่ไม่ smooth จนซ่อน event
+- **1 ชั่วโมง** — หยาบเกินไป หาเวลาที่ pump เกิดขึ้นไม่ได้
+
+---
+
+### compute_ohlcv.py — ทำไม `first`/`last` สำหรับ open/close แทน order by timestamp?
+
+```python
+F.first(F.col("price")).alias("open"),
+F.last(F.col("price")).alias("close"),
+```
+
+`F.first`/`F.last` ใน Spark ไม่รับประกันลำดับ (non-deterministic) แต่ยอมรับได้เพราะ:
+- PEPE มี trades หลายแสน rows ต่อวัน → การ orderBy ใน window ทุก candle = expensive มาก
+- ความต่างของ open/close จาก trade แรก/สุดท้ายใน window 5 นาที มีผลน้อยมากในทางปฏิบัติ
+- ใช้ OHLCV เพื่อ detect pump pattern ไม่ใช่ trading จริง precision ระดับนี้เพียงพอ
+
+---
+
+### compute_ohlcv.py — ทำไมต้องมี `buy_sell_ratio`?
+
+```python
+F.col("buyer_initiated_count") / F.col("trade_count")
+```
+
+เป็น signal เสริมสำหรับ pump detection:
+- pump ที่เกิดจาก manipulation → มักมี `buy_sell_ratio` สูงผิดปกติ (buy pressure ล้นตลาด)
+- ใช้ร่วมกับ volume และ price rise เพื่อยืนยัน signal
+
+---
+
+### detect_pump_dump.py — ทำไม rolling window approach แทนการ compare กับ daily average?
+
+หา pump จาก **จุดต่ำสุดล่าสุด 30 นาที** ไม่ใช่ daily average เพราะ:
+- daily average ไม่จับ intraday pump ที่เกิดและจบภายในไม่กี่ชั่วโมงได้
+- pump มักเริ่มจาก local low → spike ขึ้น → dump กลับ
+- rolling 30m low จับ pattern นี้ได้ตรงกว่า
+
+---
+
+### detect_pump_dump.py — ทำไม `row_number` + join แทน Window function ดู lookahead?
+
+```python
+df = df.withColumn("row_num", F.row_number().over(w_ordered))
+# แล้วค่อย join กับ future_alias
+events = pump_alias.join(future_alias,
+    (future_alias["future_row"] > pump_alias["pump_row"])
+    & (future_alias["future_row"] <= pump_alias["pump_row"] + LOOKAHEAD_CANDLES)
+)
+```
+
+Spark Window function (`rowsBetween`) ดู **อดีต** ได้ดี แต่ดู **อนาคต** (lookahead) ทำได้ยาก
+การใช้ `row_number` + join เป็นวิธีมาตรฐานใน Spark สำหรับ forward-looking operations
+
+---
+
+### detect_wash_trade.py — ทำไม time bucket ก่อน join? ไม่ join โดยตรง?
+
+```python
+# แทนที่จะ:
+pairs = buys.join(sells)  # cross join O(n²) = หายนะ
+
+# ใช้:
+pairs = buys.join(sells, buys["buy_bucket"] == sells["sell_bucket"])
+```
+
+PEPE มี trades ~1 ล้าน rows/วัน cross join = 1 ล้าน × 1 ล้าน = 1 **ล้านล้าน** คู่ → OOM แน่นอน
+bucket join จับคู่เฉพาะ trades ใน **second เดียวกัน** → ลด search space เหลือ k² โดย k = trades ต่อ 1 second (น้อยกว่ามาก)
+
+---
+
+### detect_wash_trade.py — ทำไม threshold `time_diff < 1000ms, price_diff < 0.1%, qty_similarity > 90%`?
+
+| เงื่อนไข | ค่า | เหตุผล |
+|---|---|---|
+| `time_diff < 1000ms` | < 1 วินาที | wash trade ต้องเกิดเกือบพร้อมกัน — ต่างกันเกิน 1 วินาทีอาจเป็น coincidence |
+| `price_diff < 0.1%` | < 0.1% | ราคาต้องเกือบเท่ากัน — ถ้าต่างมากกว่านี้คือ market movement ปกติ |
+| `qty_similarity > 90%` | > 90% | ปริมาณต้องใกล้เคียงกัน — wash trade มักใช้ amount เดิม |
+
+ทั้ง 3 เงื่อนไขต้องผ่านพร้อมกัน เพื่อกรอง false positive ออกให้มากที่สุด
+
+---
+
+### detect_wash_trade.py — ทำไม weight time 40%, price 35%, qty 25%?
+
+```python
+"wash_score",
+F.col("time_score")  * 0.40
++ F.col("price_score") * 0.35
++ F.col("qty_score")   * 0.25
+```
+
+- **Time (40%)** — สำคัญที่สุด: wash trade จริงต้องเกิดแทบพร้อมกัน
+- **Price (35%)** — สำคัญมาก: ราคาเหมือนกันบ่งชี้เป็น coordinated order
+- **Qty (25%)** — สำคัญน้อยที่สุด: บางครั้ง wash trader แยก order เป็นหลาย lot ขนาดต่างกันเล็กน้อย
+
+weight เหล่านี้สะท้อนว่า **เวลาและราคาคือหลักฐานหลัก** ของ wash trade
+
+---
+
+### dq/quality_checks.py — ทำไมแยกเป็นไฟล์ต่างหาก?
+
+ถ้าเขียน DQ check ไว้ใน `bronze_to_silver.py` โดยตรง:
+- ทดสอบแยกไม่ได้
+- นำไปใช้กับ pipeline อื่นในอนาคตไม่ได้
+
+การแยกเป็น `dq/quality_checks.py` = **reusable module** ที่ import ได้จากทุก Spark job
+
+---
+
+### dq/quality_checks.py — ทำไม threshold 1% สำหรับ price/qty แต่ 5% สำหรับ timestamp?
+
+```python
+if invalid_prices / total_rows > 0.01:   # 1%
+    raise ValueError(...)
+if out_of_range / total_rows > 0.05:     # 5%
+    raise ValueError(...)
+```
+
+- **price/qty invalid 1%** — ข้อมูลราคา/ปริมาณเสียเกิน 1% = data source มีปัญหาร้ายแรง ควรหยุด
+- **timestamp out-of-range 5%** — Binance daily file บางครั้งมี trades ที่ timestamp ข้ามเที่ยงคืน UTC เล็กน้อย (timezone edge case) → 5% ยืดหยุ่นพอที่จะ tolerate กรณีนี้
+
+---
+
+### sql/init.sql — ทำไมใช้ Star Schema (dim + fact)?
+
+ทางเลือก: เก็บทุกอย่างใน table เดียวใหญ่ ๆ
+
+**ปัญหาของ flat table:** `trade_date` ซ้ำใน every row → query เช่น "วันไหนเป็น weekend" ต้องแปลงใน query ทุกครั้ง
+
+**Star schema:**
+- `dim_date` เก็บ attributes ของวัน (weekend/weekday, month, year) ไว้ที่เดียว
+- `fact_trades` join กับ `dim_date` → query ทำได้ง่ายและเร็ว
+
+---
+
+### sql/init.sql — ทำไม `DECIMAL(20, 10)` สำหรับราคา ไม่ใช้ `FLOAT`?
+
+```sql
+price DECIMAL(20, 10) NOT NULL,
+```
+
+ราคา PEPE = `0.00000347` — ถ้าใช้ `FLOAT`:
+- IEEE 754 floating point มี precision error: `0.00000347` อาจกลายเป็น `0.000003469999998...`
+- ใน financial data ความถูกต้องของตัวเลขสำคัญมาก
+
+`DECIMAL` เก็บตัวเลขแบบ **exact** ไม่มี rounding error
+
+---
+
+### sql/init.sql — ทำไม index บน `trade_time`, `trade_date`, `wash_score`?
+
+```sql
+INDEX idx_trade_time (trade_time),
+INDEX idx_wash_score (wash_score),
+```
+
+query ที่ใช้บ่อยที่สุด:
+- ดู trades ช่วงเวลาหนึ่ง → filter `WHERE trade_time BETWEEN ...` → index ช่วย
+- กรอง wash trade confidence สูง → filter `WHERE wash_score >= 0.9` → index ช่วย
+
+ไม่มี index → MySQL scan ทุก row ทุกครั้ง → ช้าเมื่อข้อมูลโต
+
+---
+
+### sql/init.sql — ทำไม seed `dim_date` ถึงปี 2029 ตั้งแต่ต้น?
+
+```sql
+WHERE DATE('2026-01-01') + INTERVAL seq DAY <= DATE('2029-12-31')
+```
+
+`dim_date` ต้องมีข้อมูลอยู่ก่อน **ก่อน** ที่ `fact_trades` จะ insert ได้ (เพราะมี foreign key)
+การ pre-seed ถึงปี 2029 = ไม่ต้องมานึกถึงเรื่องนี้อีกหลายปี และไม่ต้อง insert dim_date ทีละวันใน pipeline
