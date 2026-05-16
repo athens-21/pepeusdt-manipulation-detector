@@ -40,3 +40,5 @@ airflow.db
 
 # Claude Code
 .claude/
+CODE_WALKTHROUGH.md
+ARCHITECTURE.md
