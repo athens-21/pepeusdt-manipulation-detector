@@ -238,3 +238,8 @@ pepe-pipeline/
 | `PATH_NOT_FOUND` ใน Spark job | ตรวจว่า `./data:/data` mount อยู่ใน spark-master และ spark-worker |
 | Airflow ไม่เห็น DAG | ตรวจว่า `./dags:/opt/airflow/dags` mount ถูกต้อง |
 | MySQL connection refused | รอ container healthy ก่อน (~30 วินาทีหลัง `up`) |
+
+
+
+
+
