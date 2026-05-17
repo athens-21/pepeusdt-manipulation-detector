@@ -351,7 +351,7 @@ https://data.binance.vision/?prefix=data/spot/daily/trades/PEPEUSDT/
 
 ### ผ่าน TablePlus (แนะนำ)
 - Host: `127.0.0.1` Port: `3306`
-- User: `pepe_user` Password: `dwpass123` Database: `pepe_dw`
+- User: `pepe_user` Password: *(ดูใน `.env`)* Database: `pepe_dw`
 - เปิด table ที่ต้องการ filter/sort ได้เลย
 
 ### ผ่าน Terminal
